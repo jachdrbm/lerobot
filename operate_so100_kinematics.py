@@ -1,3 +1,6 @@
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 from dataclasses import dataclass
 import os
 import sys
@@ -9,6 +12,7 @@ except ImportError:
     import termios  # Unix/Linux
     import tty
     WINDOWS = False
+import numpy as np
 
 # For the control diagram popup
 try:
@@ -20,6 +24,7 @@ try:
 except ImportError:
     DIAGRAM_AVAILABLE = False
 
+from lerobot.common.kinematics.kinematics import Robot, RobotKinematics
 from lerobot.common.motors.feetech import FeetechMotorsBus as MotorBus, OperatingMode
 from lerobot.common.motors import Motor, MotorNormMode
 
@@ -381,8 +386,13 @@ def run_routine(motor_bus, name):
         time.sleep(wait_secs)
 
 
-def manual_control(motor_bus):
-    prepare(motor_bus)
+def manual_control(motor_bus, start_position=None):
+    if start_position is None:
+        prepare(motor_bus)
+        position = HOME_POSITION[:] # init to home
+    else:
+        position = start_position[:]
+        print("Starting manual control from current position...")
 
     # Save and open control diagram
     diagram_file = show_control_diagram()
@@ -392,7 +402,7 @@ def manual_control(motor_bus):
     if diagram_file:
         print("Control diagram saved - open robot_controls.png if you need key reference")
     print("Press any key to start controlling the robot...")
-    print("(Press 'Q' uppercase to quit)")
+    print("(Press 'Q' to quit, 'x' to switch to IK mode)")
     print()
 
     incr = 20 # amount moved each input loop
@@ -409,7 +419,7 @@ def manual_control(motor_bus):
         'k': (4, +1), 'i': (4, -1),
         # Note: 'u' and 'o' for gripper are handled separately for full open/close
     }
-    position = HOME_POSITION[:] # init to home
+    
     set_goal(motor_bus, make_safe(position))
     while True:
         char = getch()
@@ -431,6 +441,9 @@ def manual_control(motor_bus):
             curr_position = get_position(motor_bus)
             position = curr_position
             set_torque(motor_bus, enable=torque_active)
+        elif char == 'x':
+            print("\nSwitching to IK control...")
+            return ("ik", position)
         elif char == 'Q':
             break
         else:
@@ -438,6 +451,106 @@ def manual_control(motor_bus):
         print(position, f"torque:{torque_active}")
     
     print("\nExiting manual control...")
+    return ("quit", position)
+
+
+def ik_control(motor_bus, robot, robot_kin, start_position=None):
+    """Control the robot's end-effector position using inverse kinematics."""
+    if start_position is None:
+        prepare(motor_bus)
+        current_servo_pos = HOME_POSITION[:]
+    else:
+        current_servo_pos = start_position[:]
+        print("Starting IK control from current position...")
+
+    print("\nInverse Kinematics Control Active")
+    print("Controls:")
+    print("  W/S: Move along +Z / -Z")
+    print("  A/D: Move along -X / +X")
+    print("  R/F: Move along +Y / -Y")
+    print("\nPress 'M' to switch to manual mode, 'Q' to quit.")
+
+    # Conversion helpers
+    servo_limits_low = np.array([j.limit_low for j in JOINTS])
+    servo_limits_high = np.array([j.limit_high for j in JOINTS])
+    mech_limits_low = robot.mech_joint_limits_low
+    mech_limits_high = robot.mech_joint_limits_up
+
+    def servo_to_rad(servo_pos):
+        servo_pos_np = np.array(servo_pos)
+        rad_pos = mech_limits_low + (servo_pos_np - servo_limits_low) * (mech_limits_high - mech_limits_low) / (servo_limits_high - servo_limits_low)
+        return rad_pos
+
+    def rad_to_servo(rad_pos):
+        rad_pos_np = np.array(rad_pos)
+        servo_pos = servo_limits_low + (rad_pos_np - mech_limits_low) * (servo_limits_high - servo_limits_low) / (mech_limits_high - mech_limits_low)
+        return servo_pos.astype(int).tolist()
+    pos_delta = 0.01  # 1 cm
+
+    while True:
+        # FK to get current pose
+        current_mech_rad = servo_to_rad(current_servo_pos)
+        current_q_dh = robot.from_mech_to_dh(current_mech_rad)
+        current_worldTtool = robot_kin.forward_kinematics(robot, current_q_dh)
+        
+        pos = current_worldTtool[:3, 3]
+        print(f"\rEnd-Effector at: x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}", end="")
+
+        char = getch()
+
+        if char == 'M':
+            print("\nSwitching to manual control...")
+            return ("manual", current_servo_pos)
+        elif char == 'Q':
+            print("\nExiting IK control...")
+            return ("quit", current_servo_pos)
+
+        desired_worldTtool = current_worldTtool.copy()
+        
+        moved = False
+        if char == 'w':
+            desired_worldTtool[2, 3] += pos_delta
+            moved = True
+        elif char == 's':
+            desired_worldTtool[2, 3] -= pos_delta
+            moved = True
+        elif char == 'd':
+            desired_worldTtool[0, 3] += pos_delta
+            moved = True
+        elif char == 'a':
+            desired_worldTtool[0, 3] -= pos_delta
+            moved = True
+        elif char == 'r':
+            desired_worldTtool[1, 3] += pos_delta
+            moved = True
+        elif char == 'f':
+            desired_worldTtool[1, 3] -= pos_delta
+            moved = True
+        
+        if not moved:
+            continue
+
+        try:
+            next_q_dh = robot_kin.inverse_kinematics(robot, current_q_dh, desired_worldTtool, use_orientation=False)
+            
+            next_mech_rad_arm = robot.from_dh_to_mech(next_q_dh)
+            
+            # Keep gripper position unchanged
+            gripper_rad = current_mech_rad[5]
+            full_next_mech_rad = np.append(next_mech_rad_arm, gripper_rad)
+
+            robot.check_joint_limits(full_next_mech_rad)
+
+            next_servo_pos = rad_to_servo(full_next_mech_rad)
+            
+            set_goal(motor_bus, make_safe(next_servo_pos))
+            
+            current_servo_pos = next_servo_pos
+
+        except Exception as e:
+            # Flashing the error message would be better, but this is fine.
+            print(f"\n[IK Error] Could not reach target: {e}")
+            pass
 
 
 def info(motor_bus):
@@ -507,7 +620,43 @@ def menu(choices):
     choices[int(choice)-1][1]()
 
 
-def main_menu(motor_bus):
+def seamless_manual_control(motor_bus, robot, robot_kin):
+    """Manual control with seamless IK switching."""
+    prepare(motor_bus)
+    current_position = HOME_POSITION[:]
+    
+    while True:
+        result = manual_control(motor_bus, current_position)
+        if result[0] == "ik":
+            current_position = result[1]
+            ik_result = ik_control(motor_bus, robot, robot_kin, current_position)
+            if ik_result[0] == "manual":
+                current_position = ik_result[1]
+                continue  # Back to manual control
+            else:  # quit
+                break
+        else:  # quit
+            break
+
+def seamless_ik_control(motor_bus, robot, robot_kin):
+    """IK control with seamless manual switching."""
+    prepare(motor_bus)
+    current_position = HOME_POSITION[:]
+    
+    while True:
+        result = ik_control(motor_bus, robot, robot_kin, current_position)
+        if result[0] == "manual":
+            current_position = result[1]
+            manual_result = manual_control(motor_bus, current_position)
+            if manual_result[0] == "ik":
+                current_position = manual_result[1]
+                continue  # Back to IK control
+            else:  # quit
+                break
+        else:  # quit
+            break
+
+def main_menu(motor_bus, robot, robot_kin):
     # Generate routine submenu choices
     routine_choices = []
     for seq_name in SEQUENCES:
@@ -516,7 +665,8 @@ def main_menu(motor_bus):
 
     # Main menu
     main_choices = (
-        ("Manual control", lambda: manual_control(motor_bus)),
+        ("Manual control", lambda: seamless_manual_control(motor_bus, robot, robot_kin)),
+        ("IK control", lambda: seamless_ik_control(motor_bus, robot, robot_kin)),
         ("Run routine", lambda: menu(routine_choices)),
         ("Monitor position", lambda: monitor_position(motor_bus)),
         ("Quit", lambda: print("Goodbye!")),
@@ -538,12 +688,16 @@ if __name__ == "__main__":
     )
     motor_bus.connect()
 
+    # Initialize kinematics
+    robot = Robot(robot_type="so100")
+    robot_kin = RobotKinematics()
+
     try:
         # Display info first
         info(motor_bus)
 
         # Choose/start task
-        main_menu(motor_bus)
+        main_menu(motor_bus, robot, robot_kin)
 
     finally:
         shut_down(motor_bus)
